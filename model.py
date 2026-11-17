@@ -3,9 +3,13 @@
 The forecast for hours 2..24 of a release day is a ratio to the hour-1 print,
 learned from past launches with one feature per launch: how far the peak of
 the 12 hours before the day sat above hour 1, on the log scale. Each hour gets
-its own weighted ridge regression of ln(v_h / v1) on that feature, launches
-that unlocked at midnight local time weigh 20 times more than the rest, and
-the coefficients are smoothed over neighbouring hours before use.
+its own weighted ridge regression of ln(v_h / v1) on that feature, and the
+coefficients are smoothed over neighbouring hours before use.
+
+A training launch's weight depends on the case being forecast: an unlock
+weight (20 for midnight-local or rolling unlocks, else 1) times a size weight,
+exp(-|ln(v1_c / p)| / 0.5) + 0.05, that favours launches whose hour 1 was
+about as big as the case's. The regression is therefore fitted per case.
 """
 
 from __future__ import annotations
@@ -24,10 +28,12 @@ RIDGE = 20.0
 LOCAL_UNLOCK_WEIGHT = 20.0
 LOCAL_UNLOCK_MARKERS = ("midnight local", "rolling")
 NOT_A_LAUNCH_MARKER = "not a launch"
+SIZE_SCALE = 0.5
+SIZE_FLOOR = 0.05
 MIN_TRAINING_LAUNCHES = 5
 FEATURE_MARGIN = 0.5
 SPREAD_FLOOR = 0.1
-SPREAD_SCALE = 0.75
+SPREAD_SCALE = 0.9
 BASELINE_SPREAD = 0.15
 
 MIN_QUANTILE = 0.01
@@ -81,14 +87,14 @@ class Launch:
     """One past launch reduced to what the regression needs."""
 
     name: str
-    weight: float
+    unlock_weight: float
     hour1: float
     feature: float
     log_ratios: tuple[float, ...]  # ln(v_h / v1) for h = 2..24
 
     @property
     def midnight_local(self) -> bool:
-        return self.weight == LOCAL_UNLOCK_WEIGHT
+        return self.unlock_weight == LOCAL_UNLOCK_WEIGHT
 
 
 def is_launch(comparable: dict) -> bool:
@@ -96,12 +102,30 @@ def is_launch(comparable: dict) -> bool:
     return NOT_A_LAUNCH_MARKER not in str(comparable.get("unlock", "")).lower()
 
 
-def launch_weight(unlock: str) -> float:
+def unlock_weight(unlock: str) -> float:
     """20 for launches that unlocked at midnight local time, else 1."""
     text = unlock.lower()
     if any(marker in text for marker in LOCAL_UNLOCK_MARKERS):
         return LOCAL_UNLOCK_WEIGHT
     return 1.0
+
+
+def size_weight(launch_hour1: float, hour1: float) -> float:
+    """exp(-|ln(v1_c / p)| / 0.5) + 0.05: about 1.05 for a launch the size of the case.
+
+    The floor keeps every launch in play, so a case bigger than every comparable
+    is not handed entirely to the largest one or two.
+    """
+    return math.exp(-abs(math.log(launch_hour1 / hour1)) / SIZE_SCALE) + SIZE_FLOOR
+
+
+def training_weight(launch: Launch, hour1: float) -> float:
+    """A launch's weight when forecasting a case whose hour-1 print is hour1."""
+    return launch.unlock_weight * size_weight(launch.hour1, hour1)
+
+
+def training_weights(launches: list[Launch], hour1: float) -> list[float]:
+    return [training_weight(launch, hour1) for launch in launches]
 
 
 def release_day_viewers(by_hour: dict[datetime, float], day_start: datetime) -> list[float] | None:
@@ -141,7 +165,7 @@ def extract_launch(comparable: dict) -> Launch | None:
     hour1 = day[0]
     return Launch(
         name=str(comparable.get("name", "")),
-        weight=launch_weight(str(comparable.get("unlock", ""))),
+        unlock_weight=unlock_weight(str(comparable.get("unlock", ""))),
         hour1=hour1,
         feature=log_peak_ratio(peak, hour1),
         log_ratios=tuple(math.log(viewers / hour1) for viewers in day[1:]),
@@ -205,10 +229,10 @@ def smooth(values: list[float]) -> list[float]:
     return smoothed
 
 
-def fit_model(launches: list[Launch]) -> Model:
-    """Fit one ridge regression per forecast hour and smooth the coefficients."""
+def fit_model(launches: list[Launch], hour1: float) -> Model:
+    """Fit one ridge regression per forecast hour, weighted for a case with print hour1, and smooth."""
     xs = [launch.feature for launch in launches]
-    ws = [launch.weight for launch in launches]
+    ws = training_weights(launches, hour1)
     raw_fits = [
         fit_weighted_ridge(xs, [launch.log_ratios[index] for launch in launches], ws)
         for index in range(len(FORECAST_HOURS))
@@ -290,7 +314,7 @@ def forecast_case(case: dict) -> dict:
     launches = training_launches(case.get("comparables") or [])
     if len(launches) < MIN_TRAINING_LAUNCHES:
         return {"hours": hour_rows(baseline_quantiles(hour1))}
-    model = fit_model(launches)
+    model = fit_model(launches, hour1)
     feature = case_feature(case.get("history_hourly") or [], parse_utc(case["day_start"]), hour1)
     if feature is None:
         feature = model.feature_mean
